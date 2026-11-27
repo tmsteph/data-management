@@ -1,0 +1,63 @@
+name: Isolated requests dependency reproduction
+on:
+  push:
+    branches: [ci/requests-dependency-repro]
+permissions:
+  contents: read
+jobs:
+  dependency-repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Check pinned upstream baseline and corrected environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          git init -q "$work/source"
+          git -C "$work/source" fetch -q --depth=1 https://github.com/hacker-fab/data-management.git ae5436a33443193fe2ca17a05194e58db2d75034
+          git -C "$work/source" checkout -q --detach FETCH_HEAD
+          cd "$work/source"
+          test "$(git rev-parse HEAD)" = ae5436a33443193fe2ca17a05194e58db2d75034
+          git rev-parse HEAD
+          python3 -m venv "$work/venv"
+          py="$work/venv/bin/python"
+          "$py" -c 'import sys, importlib.util; assert sys.prefix != sys.base_prefix; assert importlib.util.find_spec("requests") is None; print(sys.version)'
+          printf '%s\n' 'Django==5.2.8' 'Pillow==11.3.0' 'asgiref==3.10.0' 'sqlparse==0.5.3' > "$work/constraints.txt"
+          "$py" -m pip --isolated --disable-pip-version-check --no-input install --only-binary=:all: --timeout 15 --retries 0 -r requirements.txt -c "$work/constraints.txt"
+          "$py" -m pip freeze
+          cat > "$work/check.py" <<'PY'
+          import importlib.util, os, sys
+          from unittest.mock import patch
+          sys.path.insert(0, os.getcwd())
+          os.environ['DJANGO_SETTINGS_MODULE'] = 'webapps.settings'
+          from webapps import settings
+          settings.DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}
+          import django
+          from django.core.management import call_command
+          print('REQUESTS_PRESENT=' + str(importlib.util.find_spec('requests') is not None), flush=True)
+          with patch('socket.socket.connect', side_effect=AssertionError('External connections forbidden during app check')):
+              try:
+                  django.setup()
+                  call_command('check')
+              except ModuleNotFoundError as exc:
+                  if exc.name != 'requests':
+                      raise
+                  print('MISSING_REQUESTS_REPRODUCED', flush=True)
+                  sys.exit(42)
+          print('DJANGO_SYSTEM_CHECK_PASS', flush=True)
+          PY
+          rc=0
+          "$py" "$work/check.py" || rc=$?
+          if [ "$rc" = 42 ]; then
+            "$py" -m pip --isolated --disable-pip-version-check --no-input install --only-binary=:all: --timeout 15 --retries 0 'requests==2.32.5'
+            "$py" -m pip freeze
+            "$py" "$work/check.py"
+            echo DEPENDENCY_OMISSION_CONFIRMED_AND_CONTROL_PASS
+          elif [ "$rc" = 0 ]; then
+            echo MISSING_REQUESTS_NOT_REPRODUCED
+            exit 1
+          else
+            exit "$rc"
+          fi
